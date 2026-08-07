@@ -1,0 +1,3 @@
+PyQt6==6.11.0
+# X11 backend, Linux only. On Windows input_win32.py talks to user32 via ctypes.
+python-xlib==0.33; sys_platform == "linux"

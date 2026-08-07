@@ -1,0 +1,55 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build livedot.exe
+        # --windowed keeps the console window from showing up behind the overlay.
+        # The X11 backend is never imported on Windows, so leaving it out avoids
+        # a missing-Xlib warning and shaves the bundle.
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed
+          --name livedot
+          --exclude-module Xlib
+          --exclude-module input_x11
+          livedot.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: livedot-windows
+          path: dist/livedot.exe
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$env:GITHUB_REF_NAME" 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create "$env:GITHUB_REF_NAME" --generate-notes
+          }
+          gh release upload "$env:GITHUB_REF_NAME" dist/livedot.exe --clobber
