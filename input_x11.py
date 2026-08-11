@@ -101,11 +101,13 @@ class HotkeyListenerThread(threading.Thread):
         self.running = True
         self.daemon = True
         self.thread_display = None
+        self.error = None  # set when the hotkey could not be installed at all
 
     def run(self):
         try:
             self.thread_display = Display()
         except Exception as e:
+            self.error = f"não foi possível conectar ao servidor X: {e}"
             logger.error(f"Failed to open display connection in hotkey thread: {e}")
             return
 
@@ -118,6 +120,7 @@ class HotkeyListenerThread(threading.Thread):
                 keycode = get_keycode_from_keysym(self.thread_display, target)
                 button_code = 0
         except Exception as e:
+            self.error = f"atalho '{self.hotkey_str}' inválido: {e}"
             logger.error(f"Failed to parse or map hotkey '{self.hotkey_str}': {e}")
             self.thread_display.close()
             return
@@ -210,9 +213,11 @@ class InputBackend:
 
     def __init__(self):
         self.display = Display()
+        self.last_error = None
 
         # Check XTest extension
         if not self.display.has_extension("XTEST"):
+            self.last_error = "extensão XTEST ausente: o encaminhamento do atalho não funciona"
             logger.warning("XTest extension is not supported by this X server! Hotkey forwarding will fail.")
 
     def create_listener(self, hotkey_str, callback):

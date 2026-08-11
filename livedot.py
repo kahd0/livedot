@@ -246,6 +246,18 @@ class OverlayWindow(QWidget):
             }
         """)
         
+        # Surface hotkey problems here: a refused registration or a blocked
+        # SendInput is otherwise indistinguishable from "the app does nothing".
+        error = self.input_manager.status_error()
+        if error:
+            # QMenu does not wrap, so keep the row short and leave the full text
+            # to the tooltip and the log.
+            short = error if len(error) <= 60 else error[:57] + "..."
+            warning = menu.addAction(f"⚠ {short}")
+            warning.setToolTip(error)
+            warning.setEnabled(False)
+            menu.addSeparator()
+
         # Configurações
         settings_action = menu.addAction("Configurações")
         settings_action.triggered.connect(self.show_settings)

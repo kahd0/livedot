@@ -53,6 +53,17 @@ class InputManager:
     def forward_discord_hotkey(self):
         self.backend.send_hotkey(self.state_manager.config["discord_hotkey"])
 
+    def status_error(self):
+        """Returns a human-readable problem with the hotkeys, or None.
+
+        Both halves fail silently into the log otherwise: a hotkey the OS
+        refuses to register and a forward the OS refuses to deliver look exactly
+        like "the app does nothing" from the outside.
+        """
+        if self.listener_thread is not None and self.listener_thread.error:
+            return self.listener_thread.error
+        return getattr(self.backend, "last_error", None)
+
     def close(self):
         if self.listener_thread:
             self.listener_thread.stop()
