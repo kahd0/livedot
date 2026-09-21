@@ -1,37 +1,42 @@
 """Platform-agnostic global hotkey handling.
 
-The real work lives in a per-platform backend exposing three things:
-an ``InputBackend`` with ``create_listener()``, ``send_hotkey()`` and ``close()``.
+The real work lives in a per-platform backend exposing a
+``HotkeyListenerThread(hotkey_str, callback)`` with ``start()``, ``stop()``,
+``hotkey_str`` and ``error``.
 """
 
 import sys
 import logging
 
+from PyQt6.QtCore import QObject, pyqtSignal
+
 logger = logging.getLogger("livedot.input")
 
 if sys.platform == "win32":
-    from input_win32 import InputBackend
+    from input_win32 import HotkeyListenerThread
 else:
-    from input_x11 import InputBackend
+    from input_x11 import HotkeyListenerThread
 
 
-class InputManager:
+class InputManager(QObject):
+    # Emitted from the listener thread; Qt queues it onto the GUI thread,
+    # so connected slots never run inside the X11 loop or a Windows hook.
+    triggered = pyqtSignal()
+
     def __init__(self, state_manager):
+        super().__init__()
         self.state_manager = state_manager
-        self.backend = InputBackend()
         self.listener_thread = None
 
-        # Connect to state manager config changes
+        # Recreate the listener when the hotkey changes in config
         self.state_manager.config_saved.connect(self.sync_listener_hotkey)
-        # Connect to state changes to forward the hotkey to Discord on clicks/hotkeys
-        self.state_manager.state_changed.connect(self.on_state_changed)
 
         # Start initial listener
         self.start_listener()
 
     def start_listener(self):
         hotkey = self.state_manager.config["app_hotkey"]
-        self.listener_thread = self.backend.create_listener(hotkey, self.on_hotkey_triggered)
+        self.listener_thread = HotkeyListenerThread(hotkey, self.triggered.emit)
         self.listener_thread.start()
 
     def sync_listener_hotkey(self):
@@ -42,29 +47,16 @@ class InputManager:
             self.listener_thread.stop()
             self.start_listener()
 
-    def on_hotkey_triggered(self):
-        """Callback from hotkey thread. Toggles state."""
-        self.state_manager.toggle_mute()
-
-    def on_state_changed(self, is_muted: bool):
-        """Called whenever the state changes (via hotkey or mouse click) to forward key."""
-        self.forward_discord_hotkey()
-
-    def forward_discord_hotkey(self):
-        self.backend.send_hotkey(self.state_manager.config["discord_hotkey"])
-
     def status_error(self):
-        """Returns a human-readable problem with the hotkeys, or None.
+        """Returns a human-readable problem with the hotkey, or None.
 
-        Both halves fail silently into the log otherwise: a hotkey the OS
-        refuses to register and a forward the OS refuses to deliver look exactly
-        like "the app does nothing" from the outside.
+        A hotkey the OS refuses to register looks exactly like "the app does
+        nothing" from the outside, so the menu surfaces it.
         """
-        if self.listener_thread is not None and self.listener_thread.error:
+        if self.listener_thread is not None:
             return self.listener_thread.error
-        return getattr(self.backend, "last_error", None)
+        return None
 
     def close(self):
         if self.listener_thread:
             self.listener_thread.stop()
-        self.backend.close()

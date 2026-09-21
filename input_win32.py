@@ -1,6 +1,6 @@
 """Windows input backend: global hotkeys via RegisterHotKey (falling back to a
-WH_KEYBOARD_LL hook) plus WH_MOUSE_LL for thumb buttons, key forwarding via
-SendInput. Mirrors the semantics of input_x11.py."""
+WH_KEYBOARD_LL hook) plus WH_MOUSE_LL for thumb buttons. Mirrors the semantics
+of input_x11.py."""
 
 import ctypes
 import ctypes.wintypes as wintypes
@@ -44,9 +44,7 @@ VK_MENU = 0x12  # Alt
 VK_LWIN = 0x5B
 VK_RWIN = 0x5C
 
-# Sided variants. SendInput has to use these: a real keyboard never emits the
-# generic VK_CONTROL, and apps that key off the sided code (or the scan code
-# behind it) ignore the generic one.
+# Sided variants, needed to tell whether a Win key is down (it has no generic VK).
 VK_LSHIFT = 0xA0
 VK_RSHIFT = 0xA1
 VK_LCONTROL = 0xA2
@@ -54,31 +52,15 @@ VK_RCONTROL = 0xA3
 VK_LMENU = 0xA4
 VK_RMENU = 0xA5
 
-# (RegisterHotKey flag, generic VK, VK to synthesize) for every modifier.
+# (RegisterHotKey flag, generic VK, sided VKs) for every modifier.
 MODIFIERS = (
-    (MOD_CONTROL, VK_CONTROL, VK_LCONTROL, (VK_LCONTROL, VK_RCONTROL)),
-    (MOD_ALT, VK_MENU, VK_LMENU, (VK_LMENU, VK_RMENU)),
-    (MOD_SHIFT, VK_SHIFT, VK_LSHIFT, (VK_LSHIFT, VK_RSHIFT)),
-    (MOD_WIN, VK_LWIN, VK_LWIN, (VK_LWIN, VK_RWIN)),
+    (MOD_CONTROL, VK_CONTROL, (VK_LCONTROL, VK_RCONTROL)),
+    (MOD_ALT, VK_MENU, (VK_LMENU, VK_RMENU)),
+    (MOD_SHIFT, VK_SHIFT, (VK_LSHIFT, VK_RSHIFT)),
+    (MOD_WIN, VK_LWIN, (VK_LWIN, VK_RWIN)),
 )
 
-INPUT_MOUSE = 0
-INPUT_KEYBOARD = 1
-
-KEYEVENTF_EXTENDEDKEY = 0x0001
-KEYEVENTF_KEYUP = 0x0002
-MOUSEEVENTF_XDOWN = 0x0080
-MOUSEEVENTF_XUP = 0x0100
-
-MAPVK_VK_TO_VSC_EX = 4
-
 HOTKEY_ID = 1
-
-# Stamped into dwExtraInfo of every event we synthesize so our own low-level
-# hooks can tell them apart from real input. Without this, binding the app
-# hotkey and the Discord hotkey to the same key or button would make the
-# forwarded event re-trigger the toggle in a loop.
-INJECTED_SIGNATURE = 0x4C564454  # "LVDT"
 
 # Qt key names -> virtual-key codes. Single characters and F-keys are resolved
 # dynamically below, so only the named keys need to live here.
@@ -113,45 +95,8 @@ VK_MAP = {
 for _i in range(1, 25):
     VK_MAP[f"f{_i}"] = 0x6F + _i  # VK_F1 == 0x70
 
-# Keys that live on the extended half of the keyboard. MapVirtualKeyW normally
-# reports these itself; the set is a backstop for layouts where it doesn't.
-EXTENDED_VKS = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
-                0x2C, 0x2D, 0x2E, 0x90, 0x6F, 0xA3, 0xA5, VK_LWIN, VK_RWIN}
-
 ULONG_PTR = ctypes.c_uint64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 LRESULT = ctypes.c_ssize_t
-
-
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [("wVk", wintypes.WORD),
-                ("wScan", wintypes.WORD),
-                ("dwFlags", wintypes.DWORD),
-                ("time", wintypes.DWORD),
-                ("dwExtraInfo", ULONG_PTR)]
-
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [("dx", wintypes.LONG),
-                ("dy", wintypes.LONG),
-                ("mouseData", wintypes.DWORD),
-                ("dwFlags", wintypes.DWORD),
-                ("time", wintypes.DWORD),
-                ("dwExtraInfo", ULONG_PTR)]
-
-
-class HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [("uMsg", wintypes.DWORD),
-                ("wParamL", wintypes.WORD),
-                ("wParamH", wintypes.WORD)]
-
-
-class _INPUTUNION(ctypes.Union):
-    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
-
-
-class INPUT(ctypes.Structure):
-    _anonymous_ = ("u",)
-    _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
 
 
 class MSLLHOOKSTRUCT(ctypes.Structure):
@@ -172,8 +117,6 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
 
 HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
-user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
-user32.SendInput.restype = wintypes.UINT
 user32.SetWindowsHookExW.argtypes = (ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD)
 user32.SetWindowsHookExW.restype = wintypes.HHOOK
 user32.CallNextHookEx.argtypes = (wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
@@ -186,8 +129,6 @@ user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
 user32.GetAsyncKeyState.restype = ctypes.c_short
 user32.VkKeyScanW.argtypes = (wintypes.WCHAR,)
 user32.VkKeyScanW.restype = ctypes.c_short
-user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
-user32.MapVirtualKeyW.restype = wintypes.UINT
 kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
@@ -263,9 +204,8 @@ def describe_hotkey(modifiers, target, is_mouse):
              if modifiers & flag]
     if is_mouse:
         names.append("XButton1" if target == XBUTTON1 else "XButton2")
-        return "+".join(names)
-    scan, extended = scan_code_for(target)
-    names.append(f"vk 0x{target:02X} (scan 0x{scan:02X}{', extended' if extended else ''})")
+    else:
+        names.append(f"vk 0x{target:02X}")
     return "+".join(names)
 
 
@@ -274,42 +214,9 @@ def is_down(vk):
     return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
 
-def scan_code_for(vk):
-    """Returns (scan_code, is_extended) for a virtual key.
-
-    SendInput does not fill the scan code in for us. Anything that identifies
-    keys by scan code rather than virtual key -- games, and the low-level hooks
-    voice apps like Discord use for their global keybinds -- silently drops
-    events that arrive with wScan == 0, which is why forwarding looked like a
-    no-op even though SendInput reported success.
-    """
-    mapped = user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX)
-    extended = (mapped >> 8) in (0xE0, 0xE1) or vk in EXTENDED_VKS
-    return mapped & 0xFF, extended
-
-
-def _key_input(vk, keyup):
-    scan, extended = scan_code_for(vk)
-    flags = KEYEVENTF_KEYUP if keyup else 0
-    if extended:
-        flags |= KEYEVENTF_EXTENDEDKEY
-    item = INPUT(type=INPUT_KEYBOARD)
-    item.ki = KEYBDINPUT(wVk=vk, wScan=scan, dwFlags=flags, time=0,
-                         dwExtraInfo=INJECTED_SIGNATURE)
-    return item
-
-
-def _xbutton_input(xbutton, keyup):
-    item = INPUT(type=INPUT_MOUSE)
-    item.mi = MOUSEINPUT(dx=0, dy=0, mouseData=xbutton,
-                         dwFlags=MOUSEEVENTF_XUP if keyup else MOUSEEVENTF_XDOWN,
-                         time=0, dwExtraInfo=INJECTED_SIGNATURE)
-    return item
-
-
 def modifiers_held(modifiers):
     """Exact match: every modifier in the combo is held and no other one is."""
-    for flag, generic, _send_vk, sides in MODIFIERS:
+    for flag, generic, sides in MODIFIERS:
         held = any(is_down(vk) for vk in sides) if generic == VK_LWIN else is_down(generic)
         if bool(modifiers & flag) != held:
             return False
@@ -410,7 +317,7 @@ class HotkeyListenerThread(threading.Thread):
     def _on_key_event(self, n_code, w_param, l_param):
         if n_code == HC_ACTION:
             info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            if info.dwExtraInfo != INJECTED_SIGNATURE and info.vkCode == self._target:
+            if info.vkCode == self._target:
                 if w_param in (WM_KEYDOWN, WM_SYSKEYDOWN):
                     if modifiers_held(self._modifiers):
                         self._key_swallowed = True
@@ -432,9 +339,7 @@ class HotkeyListenerThread(threading.Thread):
         if n_code == HC_ACTION and w_param in (WM_XBUTTONDOWN, WM_XBUTTONUP):
             info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
             xbutton = (info.mouseData >> 16) & 0xFFFF
-            if (info.dwExtraInfo != INJECTED_SIGNATURE
-                    and xbutton == self._target
-                    and modifiers_held(self._modifiers)):
+            if xbutton == self._target and modifiers_held(self._modifiers):
                 if w_param == WM_XBUTTONDOWN:
                     logger.info("Global mouse hotkey pressed! Triggering callback...")
                     self.callback()
@@ -450,95 +355,3 @@ class HotkeyListenerThread(threading.Thread):
         self._started.wait(timeout=2.0)
         if self._thread_id:
             user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
-
-
-class InputBackend:
-    def __init__(self):
-        # SendInput is stateless, so there is no display handle to keep here.
-        self.last_error = None
-
-    def create_listener(self, hotkey_str, callback):
-        return HotkeyListenerThread(hotkey_str, callback)
-
-    def send_hotkey(self, hotkey_str):
-        """Simulates a hotkey globally using SendInput."""
-        try:
-            modifiers, target, is_mouse = parse_hotkey_string(hotkey_str)
-        except Exception as e:
-            self.last_error = f"atalho do Discord '{hotkey_str}' inválido: {e}"
-            logger.error(f"Failed to parse or resolve hotkey '{hotkey_str}': {e}")
-            return False
-
-        logger.info(f"Simulating hotkey '{hotkey_str}' -> "
-                    f"{describe_hotkey(modifiers, target, is_mouse)} via SendInput...")
-
-        events = []
-
-        # 1. Lift every modifier the user is physically holding that is not part
-        #    of the combo we are about to send. The app hotkey usually fires
-        #    while Ctrl/Alt are still down, and those keys stay in the input
-        #    state: sending "Ctrl+Shift+F12" from under a held "Ctrl+Alt+M" puts
-        #    Ctrl+Alt+Shift+F12 on the wire, which no longer matches Discord's
-        #    keybind. This is why forwarding did nothing when triggered by the
-        #    hotkey.
-        wanted = {generic for flag, generic, _send, _sides in MODIFIERS if modifiers & flag}
-        stuck = []
-        for _flag, generic, _send_vk, sides in MODIFIERS:
-            if generic in wanted:
-                continue
-            for side in sides:
-                if is_down(side):
-                    stuck.append(side)
-                    events.append(_key_input(side, keyup=True))
-        if stuck:
-            logger.info(f"Releasing {len(stuck)} held modifier(s) before forwarding.")
-
-        # 2. The trigger key itself may still be held down when the app hotkey
-        #    and the Discord hotkey share a key; release it so the tap below
-        #    reads as a fresh press rather than an auto-repeat.
-        if not is_mouse and target not in wanted and is_down(target):
-            events.append(_key_input(target, keyup=True))
-
-        # A modifier the user already holds is genuinely down in the input
-        # state, so re-pressing it only adds an auto-repeat -- and releasing it
-        # afterwards would leave the system thinking Ctrl is up while the key is
-        # still physically down. Reuse it as-is instead.
-        pressed = []
-        for flag, generic, send_vk, _sides in MODIFIERS:
-            if modifiers & flag and not is_down(generic):
-                pressed.append(send_vk)
-                events.append(_key_input(send_vk, keyup=False))
-
-        if is_mouse:
-            events.append(_xbutton_input(target, keyup=False))
-            events.append(_xbutton_input(target, keyup=True))
-        else:
-            events.append(_key_input(target, keyup=False))
-            events.append(_key_input(target, keyup=True))
-
-        events.extend(_key_input(vk, keyup=True) for vk in reversed(pressed))
-        # 3. Put the physically held modifiers back so the user's Ctrl/Alt keeps
-        #    working in whatever window is focused.
-        events.extend(_key_input(vk, keyup=False) for vk in reversed(stuck))
-
-        array = (INPUT * len(events))(*events)
-        sent = user32.SendInput(len(events), array, ctypes.sizeof(INPUT))
-        if sent != len(events):
-            err = ctypes.get_last_error()
-            # Blocked input, or the foreground app runs at a higher integrity
-            # level than we do (UIPI) -- typically Discord started as admin
-            # while Livedot did not.
-            self.last_error = (f"o Windows bloqueou o envio do atalho (erro {err}: "
-                               f"{ctypes.FormatError(err).strip()}). Se o Discord "
-                               f"roda como administrador, execute o Livedot como "
-                               f"administrador também.")
-            logger.error(f"SendInput delivered {sent}/{len(events)} events: "
-                         f"error {err} ({ctypes.FormatError(err).strip()})")
-            return False
-
-        self.last_error = None
-        logger.info("Hotkey simulation complete.")
-        return True
-
-    def close(self):
-        pass

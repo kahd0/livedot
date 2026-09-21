@@ -1,10 +1,10 @@
-"""X11/Linux input backend: global hotkey grabs and key forwarding via XTest."""
+"""X11/Linux input backend: global hotkey grabs on the root window."""
 
+import select
 import threading
 import logging
-from Xlib import X, XK
+from Xlib import X, XK, error as Xerror
 from Xlib.display import Display
-from Xlib.ext import xtest
 
 logger = logging.getLogger("livedot.input")
 
@@ -35,6 +35,22 @@ QT_TO_X11_KEY_MAP = {
     "scrolllock": "Scroll_Lock",
     "scroll lock": "Scroll_Lock"
 }
+
+# Grab once per lock-key combination so an active NumLock/CapsLock doesn't
+# stop the hotkey from matching.
+IGNORED_LOCKS = (0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask)
+
+# X autorepeat turns a held key into KeyRelease/KeyPress pairs. The server
+# stamps both halves of a pair separately, so they can be a millisecond apart;
+# no human releases and presses a key again this fast.
+AUTOREPEAT_WINDOW_MS = 20
+
+# Backoff ceiling when the X connection drops and has to be reopened.
+RECONNECT_MAX_S = 30
+
+# How often the event loop wakes up to check whether stop() was called.
+POLL_INTERVAL_S = 0.25
+
 
 def parse_hotkey_string(hotkey_str):
     """
@@ -68,21 +84,25 @@ def parse_hotkey_string(hotkey_str):
             key_name = part.strip()
 
     if is_mouse:
+        if mouse_button <= 0:
+            raise ValueError(f"Unknown mouse button in '{hotkey_str}'")
         return modifiers, mouse_button, True
 
     # Resolve mapped X11 name if exists
     x11_key_name = QT_TO_X11_KEY_MAP.get(key_name.lower(), key_name)
     return modifiers, x11_key_name, False
 
+
 def get_keycode_from_keysym(display, keysym_name):
     """Resolves an X11 keysym name to its physical keyboard keycode."""
     keysym = XK.string_to_keysym(keysym_name)
-    if keysym == 0:
-        # Retry case variants for letters/numbers
-        if len(keysym_name) == 1:
-            keysym = XK.string_to_keysym(keysym_name.lower())
-            if keysym == 0:
-                keysym = XK.string_to_keysym(keysym_name.upper())
+    if keysym == 0 and len(keysym_name) == 1:
+        # Retry case variants for letters, then the character itself:
+        # Latin-1 keysyms equal their code point, which covers punctuation
+        # such as "," whose keysym is named "comma".
+        keysym = (XK.string_to_keysym(keysym_name.lower())
+                  or XK.string_to_keysym(keysym_name.upper())
+                  or (ord(keysym_name) if ord(keysym_name) < 0x100 else 0))
 
     if keysym == 0:
         raise ValueError(f"Unknown key keysym: {keysym_name}")
@@ -93,189 +113,128 @@ def get_keycode_from_keysym(display, keysym_name):
 
     return keycode
 
+
 class HotkeyListenerThread(threading.Thread):
+    """Grabs the hotkey on the root window and calls back on every press.
+
+    Reconnects on its own if the X connection drops, so the hotkey doesn't
+    silently die for the rest of the session.
+    """
+
     def __init__(self, hotkey_str, trigger_callback):
-        super().__init__()
+        super().__init__(daemon=True)
         self.hotkey_str = hotkey_str
         self.callback = trigger_callback
-        self.running = True
-        self.daemon = True
-        self.thread_display = None
-        self.error = None  # set when the hotkey could not be installed at all
+        self.error = None  # human-readable reason the hotkey isn't working
+        self.display = None
+        self._stop_event = threading.Event()
+        self._is_mouse = False
+        self._keycode = 0
+        self._button = 0
+        self._last_release = None
 
     def run(self):
+        delay = 1
+        while not self._stop_event.is_set():
+            if not self._listen_once():
+                break
+            if self._stop_event.wait(delay):
+                break
+            delay = min(delay * 2, RECONNECT_MAX_S)
+        logger.info("Hotkey listener thread stopped.")
+
+    def _listen_once(self):
+        """Grabs the hotkey and dispatches events until the connection ends.
+        Returns True when reconnecting is worth a try."""
         try:
-            self.thread_display = Display()
+            display = Display()
         except Exception as e:
             self.error = f"não foi possível conectar ao servidor X: {e}"
             logger.error(f"Failed to open display connection in hotkey thread: {e}")
-            return
+            return True
 
+        self.display = display
         try:
-            modifiers, target, is_mouse = parse_hotkey_string(self.hotkey_str)
-            if is_mouse:
-                button_code = target
-                keycode = 0
-            else:
-                keycode = get_keycode_from_keysym(self.thread_display, target)
-                button_code = 0
+            if self._stop_event.is_set() or not self._grab(display):
+                return False
+            self.error = None
+            self._last_release = None
+            while not self._stop_event.is_set():
+                # Drain what is queued, then wait on the socket with a timeout
+                # so stop() is noticed. Closing the display from another
+                # thread would not wake a blocked next_event().
+                while display.pending_events():
+                    self._handle_event(display.next_event())
+                select.select([display], [], [], POLL_INTERVAL_S)
+            return False
         except Exception as e:
-            self.error = f"atalho '{self.hotkey_str}' inválido: {e}"
-            logger.error(f"Failed to parse or map hotkey '{self.hotkey_str}': {e}")
-            self.thread_display.close()
-            return
-
-        root = self.thread_display.screen().root
-
-        # Grab with different lock masks (NumLock, CapsLock) to avoid active locks blocking hooks
-        ignored_locks = [0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask]
-
-        # Ungrab everything first on root to be clean
-        try:
-            root.ungrab_key(X.AnyKey, X.AnyModifier, root)
-        except Exception:
-            pass
-        try:
-            root.ungrab_button(X.AnyButton, X.AnyModifier, root)
-        except Exception:
-            pass
-
-        if is_mouse:
-            logger.info(f"Grabbing global mouse button '{self.hotkey_str}' (button {button_code}, mods {modifiers})")
-            for lock in ignored_locks:
-                try:
-                    root.grab_button(
-                        button_code,
-                        modifiers | lock,
-                        True,
-                        X.ButtonPressMask,
-                        X.GrabModeAsync,
-                        X.GrabModeAsync,
-                        X.NONE,
-                        X.NONE
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to grab button (mods: {modifiers | lock}, button: {button_code}): {e}")
-        else:
-            logger.info(f"Grabbing global hotkey '{self.hotkey_str}' (keycode {keycode}, mods {modifiers})")
-            for lock in ignored_locks:
-                try:
-                    root.grab_key(
-                        keycode,
-                        modifiers | lock,
-                        True,
-                        X.GrabModeAsync,
-                        X.GrabModeAsync
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to grab key combination (mods: {modifiers | lock}, keycode: {keycode}): {e}")
-
-        self.thread_display.sync()
-
-        # Run X11 event loop
-        while self.running:
+            if self._stop_event.is_set():
+                return False
+            self.error = "conexão com o servidor X perdida; reconectando"
+            logger.error(f"Error in hotkey loop: {e}. Reconnecting...")
+            return True
+        finally:
+            self.display = None
             try:
-                event = self.thread_display.next_event()
-                if not self.running:
-                    break
-
-                if event.type == X.KeyPress and not is_mouse:
-                    logger.info("Global keyboard hotkey pressed! Triggering callback...")
-                    self.callback()
-                elif event.type == X.ButtonPress and is_mouse:
-                    if event.detail == button_code:
-                        logger.info("Global mouse hotkey pressed! Triggering callback...")
-                        self.callback()
-            except Exception as e:
-                if self.running:
-                    logger.error(f"Error in hotkey loop: {e}")
-                break
-
-        # Clean up
-        try:
-            root.ungrab_key(X.AnyKey, X.AnyModifier, root)
-            root.ungrab_button(X.AnyButton, X.AnyModifier, root)
-            self.thread_display.close()
-        except Exception:
-            pass
-        logger.info("Hotkey listener thread stopped.")
-
-    def stop(self):
-        self.running = False
-        if self.thread_display:
-            try:
-                self.thread_display.close()  # Unblocks thread_display.next_event() by raising ConnectionClosed
+                # Closing the connection also releases every grab it holds.
+                display.close()
             except Exception:
                 pass
 
-class InputBackend:
-    """Holds the long-lived display used for XTest synthesis."""
-
-    def __init__(self):
-        self.display = Display()
-        self.last_error = None
-
-        # Check XTest extension
-        if not self.display.has_extension("XTEST"):
-            self.last_error = "extensão XTEST ausente: o encaminhamento do atalho não funciona"
-            logger.warning("XTest extension is not supported by this X server! Hotkey forwarding will fail.")
-
-    def create_listener(self, hotkey_str, callback):
-        return HotkeyListenerThread(hotkey_str, callback)
-
-    def send_hotkey(self, hotkey_str):
-        """Simulates a hotkey globally using the XTest extension."""
-        logger.info(f"Simulating hotkey '{hotkey_str}' via XTest...")
-
+    def _grab(self, display):
         try:
-            modifiers, target, is_mouse = parse_hotkey_string(hotkey_str)
-            if is_mouse:
-                button_code = target
-                keycode = 0
+            modifiers, target, self._is_mouse = parse_hotkey_string(self.hotkey_str)
+            if self._is_mouse:
+                self._button = target
             else:
-                keycode = get_keycode_from_keysym(self.display, target)
-                button_code = 0
+                self._keycode = get_keycode_from_keysym(display, target)
         except Exception as e:
-            logger.error(f"Failed to parse or resolve hotkey '{hotkey_str}': {e}")
-            return
+            self.error = f"atalho '{self.hotkey_str}' inválido: {e}"
+            logger.error(f"Failed to parse or map hotkey '{self.hotkey_str}': {e}")
+            return False
 
-        # Map modifiers to keycodes
-        mod_keycodes = []
-        try:
-            if modifiers & X.ControlMask:
-                mod_keycodes.append(get_keycode_from_keysym(self.display, "Control_L"))
-            if modifiers & X.Mod1Mask:
-                mod_keycodes.append(get_keycode_from_keysym(self.display, "Alt_L"))
-            if modifiers & X.ShiftMask:
-                mod_keycodes.append(get_keycode_from_keysym(self.display, "Shift_L"))
-            if modifiers & X.Mod4Mask:
-                mod_keycodes.append(get_keycode_from_keysym(self.display, "Super_L"))
-        except Exception as e:
-            logger.error(f"Error mapping modifier keycodes for simulation: {e}")
-            return
+        root = display.screen().root
+        # Grab errors come back asynchronously, so a try/except around the
+        # calls never sees them. Collect them and check after a round trip.
+        catcher = Xerror.CatchError(Xerror.BadAccess)
+        for lock in IGNORED_LOCKS:
+            if self._is_mouse:
+                root.grab_button(self._button, modifiers | lock, True,
+                                 X.ButtonPressMask, X.GrabModeAsync, X.GrabModeAsync,
+                                 X.NONE, X.NONE, onerror=catcher)
+            else:
+                root.grab_key(self._keycode, modifiers | lock, True,
+                              X.GrabModeAsync, X.GrabModeAsync, onerror=catcher)
+        display.sync()
 
-        # Simulate modifier press
-        for m_code in mod_keycodes:
-            xtest.fake_input(self.display, X.KeyPress, m_code)
+        if catcher.get_error():
+            self.error = f"o atalho '{self.hotkey_str}' já é usado por outro programa"
+            logger.error(f"Hotkey '{self.hotkey_str}' is already grabbed by another client (BadAccess).")
+            return False
 
-        if is_mouse:
-            # Simulate mouse button press & release
-            xtest.fake_input(self.display, X.ButtonPress, button_code)
-            xtest.fake_input(self.display, X.ButtonRelease, button_code)
-        else:
-            # Simulate keyboard key press & release
-            xtest.fake_input(self.display, X.KeyPress, keycode)
-            xtest.fake_input(self.display, X.KeyRelease, keycode)
+        what = f"button {self._button}" if self._is_mouse else f"keycode {self._keycode}"
+        logger.info(f"Grabbed global hotkey '{self.hotkey_str}' ({what}, mods {modifiers})")
+        return True
 
-        # Simulate modifier release in reverse order
-        for m_code in reversed(mod_keycodes):
-            xtest.fake_input(self.display, X.KeyRelease, m_code)
+    def _handle_event(self, event):
+        if self._is_mouse:
+            if event.type == X.ButtonPress and event.detail == self._button:
+                self._fire()
+        elif event.type == X.KeyRelease and event.detail == self._keycode:
+            self._last_release = event.time
+        elif event.type == X.KeyPress and event.detail == self._keycode:
+            if (self._last_release is not None
+                    and (event.time - self._last_release) & 0xFFFFFFFF <= AUTOREPEAT_WINDOW_MS):
+                return  # autorepeat while the key is held down
+            self._fire()
 
-        self.display.sync()
-        logger.info("Hotkey simulation complete.")
+    def _fire(self):
+        logger.info("Global hotkey pressed! Triggering callback...")
+        self.callback()
 
-    def close(self):
-        try:
-            self.display.close()
-        except Exception:
-            pass
+    def stop(self):
+        self._stop_event.set()
+        # Wait for the grabs to be released, so a new listener can take over
+        # the same combination right away.
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(timeout=1.0)
