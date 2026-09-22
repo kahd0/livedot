@@ -1,8 +1,8 @@
 """Platform-agnostic global hotkey handling.
 
 The real work lives in a per-platform backend exposing a
-``HotkeyListenerThread(hotkey_str, callback)`` with ``start()``, ``stop()``,
-``hotkey_str`` and ``error``.
+``HotkeyListenerThread(hotkey_str, on_press, on_release)`` with ``start()``,
+``stop()``, ``hotkey_str`` and ``error``.
 """
 
 import sys
@@ -19,9 +19,10 @@ else:
 
 
 class InputManager(QObject):
-    # Emitted from the listener thread; Qt queues it onto the GUI thread,
+    # Emitted from the listener thread; Qt queues them onto the GUI thread,
     # so connected slots never run inside the X11 loop or a Windows hook.
-    triggered = pyqtSignal()
+    pressed = pyqtSignal()
+    released = pyqtSignal()
 
     def __init__(self, state_manager):
         super().__init__()
@@ -36,7 +37,7 @@ class InputManager(QObject):
 
     def start_listener(self):
         hotkey = self.state_manager.config["app_hotkey"]
-        self.listener_thread = HotkeyListenerThread(hotkey, self.triggered.emit)
+        self.listener_thread = HotkeyListenerThread(hotkey, self.pressed.emit, self.released.emit)
         self.listener_thread.start()
 
     def sync_listener_hotkey(self):

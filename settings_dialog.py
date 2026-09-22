@@ -1,7 +1,7 @@
 import re
 import logging
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QSlider,
-                             QCheckBox, QPushButton, QGroupBox, QLineEdit)
+                             QCheckBox, QPushButton, QGroupBox, QLineEdit, QSpinBox)
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence
 
@@ -206,8 +206,16 @@ class SettingsDialog(QDialog):
                 padding: 4px 6px;
                 font-size: 12px;
             }
-            QLineEdit:focus {
+            QLineEdit:focus, QSpinBox:focus {
                 border-color: #3b82f6;
+            }
+            QSpinBox {
+                background-color: #1e293b;
+                color: #f8fafc;
+                border: 1px solid #334155;
+                border-radius: 4px;
+                padding: 2px 4px;
+                font-size: 12px;
             }
             QPushButton {
                 background-color: #1e293b;
@@ -305,6 +313,22 @@ class SettingsDialog(QDialog):
         self.autostart_cb.stateChanged.connect(self.on_autostart_toggled)
         behavior_layout.addWidget(self.autostart_cb)
 
+        self.join_muted_cb = QCheckBox("Entrar em chamadas já mutado")
+        self.join_muted_cb.setChecked(self.state_manager.config["join_muted"])
+        self.join_muted_cb.stateChanged.connect(self.on_join_muted_toggled)
+        behavior_layout.addWidget(self.join_muted_cb)
+
+        idle_layout = QHBoxLayout()
+        idle_layout.addWidget(QLabel("Mutar mic aberto sem falar após:"))
+        self.idle_spin = QSpinBox()
+        self.idle_spin.setRange(0, 60)
+        self.idle_spin.setSuffix(" min")
+        self.idle_spin.setSpecialValueText("nunca")
+        self.idle_spin.setValue(self.state_manager.config["idle_mute_minutes"])
+        self.idle_spin.valueChanged.connect(self.state_manager.set_idle_mute_minutes)
+        idle_layout.addWidget(self.idle_spin, alignment=Qt.AlignmentFlag.AlignRight)
+        behavior_layout.addLayout(idle_layout)
+
         behavior_group.setLayout(behavior_layout)
         main_layout.addWidget(behavior_group)
 
@@ -392,6 +416,9 @@ class SettingsDialog(QDialog):
     def on_lock_toggled(self, state):
         self.state_manager.set_position_locked(self.lock_cb.isChecked())
 
+    def on_join_muted_toggled(self, state):
+        self.state_manager.set_join_muted(self.join_muted_cb.isChecked())
+
     def on_autostart_toggled(self, state):
         import autostart
         enabled = self.autostart_cb.isChecked()
@@ -416,6 +443,8 @@ class SettingsDialog(QDialog):
         """Synchronizes widget states if changed from the right click menu directly."""
         self.lock_cb.setChecked(self.state_manager.config["position_locked"])
         self.autostart_cb.setChecked(self.state_manager.config["autostart_enabled"])
+        self.join_muted_cb.setChecked(self.state_manager.config["join_muted"])
+        self.idle_spin.setValue(self.state_manager.config["idle_mute_minutes"])
         self.scale_slider.setValue(int(self.state_manager.config["scale"] * 100))
         self.opacity_slider.setValue(int(self.state_manager.config["opacity"] * 100))
         self.app_hk_val.setText(self.state_manager.config["app_hotkey"])

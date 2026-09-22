@@ -2,7 +2,9 @@
 
 Talks to the desktop client over the IPC socket it exposes (``discord-ipc-N``)
 to read the self-mute state, change it, and hear about changes made anywhere
-else (Discord's own button, its keybinds, another device).
+else (Discord's own button, its keybinds, another device). It also follows
+which voice channel the user is in, when their own voice is transmitted, and
+the notifications Discord shows for new messages.
 
 Access needs an OAuth2 token for the user's own Developer Portal application.
 The first connection asks for permission inside Discord; later ones reuse the
@@ -37,8 +39,11 @@ OP_PONG = 4
 
 TOKEN_URL = "https://discord.com/api/oauth2/token"
 REDIRECT_URI = "http://localhost"
-SCOPES = ["rpc", "rpc.voice.read", "rpc.voice.write"]
+SCOPES = ["rpc", "rpc.voice.read", "rpc.voice.write", "rpc.notifications.read"]
 USER_AGENT = "livedot (https://github.com/kahd0/livedot)"
+
+# Channel types whose every message is addressed to the user.
+DM_CHANNEL_TYPES = (1, 3)  # DM, group DM
 
 
 def ipc_candidates():
@@ -85,7 +90,11 @@ def request_token(fields):
 
 
 class DiscordRPC(QObject):
-    voice_changed = pyqtSignal(bool)        # effective mute: muted or deafened
+    voice_changed = pyqtSignal(bool, bool)  # mute, deaf
+    call_changed = pyqtSignal(bool)         # in a voice channel or not
+    call_joined = pyqtSignal()              # just joined or moved into a voice channel
+    speaking_changed = pyqtSignal(bool)     # the user's own voice is being transmitted
+    notified = pyqtSignal(str, str, bool)   # channel id, title, addressed to the user directly
     connection_changed = pyqtSignal(bool)   # True once authenticated and subscribed
     status_changed = pyqtSignal(str)        # human-readable status, in Portuguese
     _token_done = pyqtSignal(object, str, bool)  # reply, error, permanent
@@ -97,6 +106,11 @@ class DiscordRPC(QObject):
         self.ready = False
         self.mute = False
         self.deaf = False
+        self.user_id = None
+        self.channel_id = None   # voice channel the user is in, if any
+        self.speaking = False
+        self._direct_channels = {}   # channel id -> is a DM, as GET_CHANNEL said
+        self._channel_lookups = {}   # GET_CHANNEL nonce -> (channel id, title)
 
         self._socket = None
         self._buffer = b""
@@ -118,6 +132,10 @@ class DiscordRPC(QObject):
     def configured(self):
         cfg = self.state_manager.config
         return bool(cfg["discord_client_id"] and cfg["discord_client_secret"])
+
+    @property
+    def in_call(self):
+        return self.channel_id is not None
 
     def start(self):
         self._connect()
@@ -141,6 +159,19 @@ class DiscordRPC(QObject):
             self._command("SET_VOICE_SETTINGS", {"mute": False, "deaf": False})
         else:
             self._command("SET_VOICE_SETTINGS", {"mute": True})
+
+    @pyqtSlot()
+    def toggle_deaf(self):
+        if self.ready:
+            self._command("SET_VOICE_SETTINGS", {"deaf": not self.deaf})
+
+    def set_voice(self, mute, deaf):
+        if self.ready:
+            self._command("SET_VOICE_SETTINGS", {"mute": mute, "deaf": deaf})
+
+    def select_text_channel(self, channel_id):
+        if self.ready:
+            self._command("SELECT_TEXT_CHANNEL", {"channel_id": channel_id})
 
     def close(self):
         self._retry_timer.stop()
@@ -187,6 +218,8 @@ class DiscordRPC(QObject):
             sock.disconnected.disconnect(self._on_disconnected)
             sock.abort()
             sock.deleteLater()
+        self._channel_lookups.clear()
+        self._set_channel(None, joined=False)
         if self.ready:
             self.ready = False
             self.connection_changed.emit(False)
@@ -211,10 +244,12 @@ class DiscordRPC(QObject):
         self._socket.flush()
 
     def _command(self, cmd, args=None, evt=None):
+        """Sends a command and returns its nonce, which the reply echoes."""
         message = {"cmd": cmd, "args": args or {}, "nonce": str(uuid.uuid4())}
         if evt:
             message["evt"] = evt
         self._send(OP_FRAME, message)
+        return message["nonce"]
 
     def _on_ready_read(self):
         self._buffer += bytes(self._socket.readAll())
@@ -250,23 +285,38 @@ class DiscordRPC(QObject):
         data = message.get("data") or {}
 
         if evt == "ERROR":
-            self._on_error(cmd, data)
+            self._on_error(cmd, data, message.get("nonce"))
         elif cmd == "DISPATCH" and evt == "READY":
             self._authenticate_or_authorize()
         elif cmd == "DISPATCH" and evt == "VOICE_SETTINGS_UPDATE":
             self._apply_voice(data)
+        elif cmd == "DISPATCH" and evt == "VOICE_CHANNEL_SELECT":
+            self._set_channel(data.get("channel_id"), joined=True)
+        elif cmd == "DISPATCH" and evt in ("SPEAKING_START", "SPEAKING_STOP"):
+            if data.get("user_id") == self.user_id and data.get("channel_id") in (None, self.channel_id):
+                self._set_speaking(evt == "SPEAKING_START")
+        elif cmd == "DISPATCH" and evt == "NOTIFICATION_CREATE":
+            self._on_notification(data)
+        elif cmd == "GET_CHANNEL":
+            self._finish_lookup(message.get("nonce"), data)
         elif cmd == "AUTHORIZE":
             self._request_token({"grant_type": "authorization_code",
                                  "code": data.get("code", ""),
                                  "redirect_uri": REDIRECT_URI})
         elif cmd == "AUTHENTICATE":
             logger.info("Authenticated with Discord.")
+            self.user_id = (data.get("user") or {}).get("id")
             self._command("SUBSCRIBE", evt="VOICE_SETTINGS_UPDATE")
+            self._command("SUBSCRIBE", evt="VOICE_CHANNEL_SELECT")
+            self._command("SUBSCRIBE", evt="NOTIFICATION_CREATE")
+            self._command("GET_SELECTED_VOICE_CHANNEL")
             self._command("GET_VOICE_SETTINGS")
+        elif cmd == "GET_SELECTED_VOICE_CHANNEL":
+            self._set_channel(data.get("id"), joined=False)
         elif cmd in ("GET_VOICE_SETTINGS", "SET_VOICE_SETTINGS"):
             self._apply_voice(data)
 
-    def _on_error(self, cmd, data):
+    def _on_error(self, cmd, data, nonce):
         message = data.get("message") or data.get("code")
         logger.warning(f"Discord RPC error on {cmd}: {data}")
         if cmd == "AUTHENTICATE":
@@ -279,19 +329,35 @@ class DiscordRPC(QObject):
             # Expired or revoked access token: forget it and fall back to the
             # refresh token, or to a fresh authorization.
             cfg = self.state_manager.config
-            self.state_manager.set_discord_tokens("", cfg["discord_refresh_token"], 0)
+            self.state_manager.set_discord_tokens("", cfg["discord_refresh_token"], 0,
+                                                  cfg["discord_token_scopes"])
             self._authenticate_or_authorize()
         elif cmd == "AUTHORIZE":
-            self._lose(f"Autorização negada: {message}", retry=False)
+            cfg = self.state_manager.config
+            if cfg["discord_access_token"] or cfg["discord_refresh_token"]:
+                # Only the request for extra scopes was turned down: carry on
+                # with the older grant and without the features it lacks.
+                logger.info("Extra scopes refused; using the existing grant.")
+                self._authenticate_or_authorize()
+            else:
+                self._lose(f"Autorização negada: {message}", retry=False)
+        elif cmd == "GET_CHANNEL":
+            self._finish_lookup(nonce, {})
+        elif cmd in ("SUBSCRIBE", "UNSUBSCRIBE"):
+            pass  # Only the feature fed by that event is lost; the log has it.
         else:
             self._set_status(f"Erro do Discord: {message}")
 
     def _authenticate_or_authorize(self):
         cfg = self.state_manager.config
-        if cfg["discord_access_token"] and cfg["discord_token_expires"] > time.time() + 60:
+        # A grant from before some feature needed more scopes still works for
+        # the rest, but while a prompt is allowed, ask for the full set first.
+        granted = set(cfg["discord_token_scopes"].split())
+        upgrade = self._may_authorize and not set(SCOPES) <= granted
+        if not upgrade and cfg["discord_access_token"] and cfg["discord_token_expires"] > time.time() + 60:
             self._set_status("Autenticando…")
             self._command("AUTHENTICATE", {"access_token": cfg["discord_access_token"]})
-        elif cfg["discord_refresh_token"]:
+        elif not upgrade and cfg["discord_refresh_token"]:
             self._set_status("Renovando acesso…")
             self._request_token({"grant_type": "refresh_token",
                                  "refresh_token": cfg["discord_refresh_token"]})
@@ -308,11 +374,66 @@ class DiscordRPC(QObject):
             return
         self.mute = bool(data.get("mute", self.mute))
         self.deaf = bool(data.get("deaf", self.deaf))
-        self.voice_changed.emit(self.mute or self.deaf)
+        self.voice_changed.emit(self.mute, self.deaf)
         if not self.ready:
             self.ready = True
             self._set_status("Conectado")
             self.connection_changed.emit(True)
+
+    def _set_channel(self, channel_id, joined):
+        """Tracks the voice channel. ``joined`` marks a change Discord just
+        reported, as opposed to the channel we found on connecting."""
+        channel_id = channel_id or None
+        if channel_id == self.channel_id:
+            return
+        was_in_call = self.in_call
+        if self.channel_id:
+            self._subscribe_speaking("UNSUBSCRIBE", self.channel_id)
+        self.channel_id = channel_id
+        self._set_speaking(False)
+        if channel_id:
+            self._subscribe_speaking("SUBSCRIBE", channel_id)
+        logger.info(f"Voice channel: {channel_id or 'none'}")
+        if self.in_call != was_in_call:
+            self.call_changed.emit(self.in_call)
+        if channel_id and joined:
+            self.call_joined.emit()
+
+    def _subscribe_speaking(self, cmd, channel_id):
+        for evt in ("SPEAKING_START", "SPEAKING_STOP"):
+            self._command(cmd, {"channel_id": channel_id}, evt=evt)
+
+    def _set_speaking(self, speaking):
+        if speaking != self.speaking:
+            self.speaking = speaking
+            self.speaking_changed.emit(speaking)
+
+    def _on_notification(self, data):
+        """Passes on a notification Discord showed, without the message text.
+        A mention of the user is direct; so is anything in a DM, which
+        mentions nobody, so the channel type is looked up once per channel."""
+        message = data.get("message") or {}
+        channel_id = data.get("channel_id") or ""
+        title = data.get("title") or ""
+        mentioned = any((user or {}).get("id") == self.user_id
+                        for user in message.get("mentions") or [])
+        logger.info(f"Notification in channel {channel_id} (mentions us: {mentioned})")
+        if mentioned or channel_id in self._direct_channels:
+            self.notified.emit(channel_id, title,
+                               mentioned or self._direct_channels[channel_id])
+            return
+        nonce = self._command("GET_CHANNEL", {"channel_id": channel_id})
+        self._channel_lookups[nonce] = (channel_id, title)
+
+    def _finish_lookup(self, nonce, channel):
+        pending = self._channel_lookups.pop(nonce, None)
+        if pending is None:
+            return
+        channel_id, title = pending
+        direct = channel.get("type") in DM_CHANNEL_TYPES
+        if channel:
+            self._direct_channels[channel_id] = direct
+        self.notified.emit(channel_id, title, direct)
 
     # OAuth2 token exchange (runs off the GUI thread)
     def _request_token(self, grant):
@@ -350,7 +471,7 @@ class DiscordRPC(QObject):
                 return
             # The grant is dead (revoked, wrong secret): start over, which
             # prompts again if this session still may.
-            self.state_manager.set_discord_tokens("", "", 0)
+            self.state_manager.set_discord_tokens("", "", 0, "")
             if self._socket is not None and self._may_authorize:
                 self._authenticate_or_authorize()
             else:
@@ -360,7 +481,8 @@ class DiscordRPC(QObject):
         self.state_manager.set_discord_tokens(
             reply["access_token"],
             reply.get("refresh_token", ""),
-            time.time() + int(reply.get("expires_in", 0)))
+            time.time() + int(reply.get("expires_in", 0)),
+            reply.get("scope", ""))
         if self._socket is not None:
             self._set_status("Autenticando…")
             self._command("AUTHENTICATE", {"access_token": reply["access_token"]})

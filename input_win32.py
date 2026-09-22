@@ -1,10 +1,11 @@
 """Windows input backend: global hotkeys via RegisterHotKey (falling back to a
 WH_KEYBOARD_LL hook) plus WH_MOUSE_LL for thumb buttons. Mirrors the semantics
-of input_x11.py."""
+of input_x11.py, press and release included."""
 
 import ctypes
 import ctypes.wintypes as wintypes
 import threading
+import time
 import logging
 
 logger = logging.getLogger("livedot.input")
@@ -61,6 +62,9 @@ MODIFIERS = (
 )
 
 HOTKEY_ID = 1
+
+# RegisterHotKey reports only the press, so the key is polled until it is up.
+RELEASE_POLL_S = 0.015
 
 # Qt key names -> virtual-key codes. Single characters and F-keys are resolved
 # dynamically below, so only the named keys need to live here.
@@ -229,10 +233,11 @@ class HotkeyListenerThread(threading.Thread):
     another process; thumb-button hotkeys always need a low-level mouse hook,
     which RegisterHotKey cannot express."""
 
-    def __init__(self, hotkey_str, trigger_callback):
+    def __init__(self, hotkey_str, on_press, on_release):
         super().__init__()
         self.hotkey_str = hotkey_str
-        self.callback = trigger_callback
+        self.on_press = on_press
+        self.on_release = on_release
         self.running = True
         self.daemon = True
         self.error = None  # set when the hotkey could not be installed at all
@@ -243,6 +248,8 @@ class HotkeyListenerThread(threading.Thread):
         self._hook_ref = None  # must outlive the hook or Windows calls into freed memory
         self._key_down = False
         self._key_swallowed = False
+        self._button_down = False
+        self._held = False
 
     def run(self):
         self._thread_id = kernel32.GetCurrentThreadId()
@@ -291,8 +298,8 @@ class HotkeyListenerThread(threading.Thread):
             if ret in (0, -1):  # WM_QUIT or error
                 break
             if msg.message == WM_HOTKEY:
-                logger.info("Global keyboard hotkey pressed! Triggering callback...")
-                self.callback()
+                self._press()
+                threading.Thread(target=self._wait_key_up, daemon=True).start()
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
@@ -323,11 +330,12 @@ class HotkeyListenerThread(threading.Thread):
                         self._key_swallowed = True
                         if not self._key_down:  # ignore auto-repeat, like MOD_NOREPEAT
                             self._key_down = True
-                            logger.info("Global keyboard hotkey pressed! Triggering callback...")
-                            self.callback()
+                            self._press()
                         return 1
                 elif w_param in (WM_KEYUP, WM_SYSKEYUP):
-                    self._key_down = False
+                    if self._key_down:
+                        self._key_down = False
+                        self._release()
                     if self._key_swallowed:
                         # Swallow the release too, otherwise the focused app
                         # sees an unpaired key-up.
@@ -339,14 +347,35 @@ class HotkeyListenerThread(threading.Thread):
         if n_code == HC_ACTION and w_param in (WM_XBUTTONDOWN, WM_XBUTTONUP):
             info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
             xbutton = (info.mouseData >> 16) & 0xFFFF
-            if xbutton == self._target and modifiers_held(self._modifiers):
-                if w_param == WM_XBUTTONDOWN:
-                    logger.info("Global mouse hotkey pressed! Triggering callback...")
-                    self.callback()
-                # Swallow both halves of the click to match the X11 grab, which
-                # keeps the button from also reaching the focused window.
-                return 1
+            # Swallow both halves of the click to match the X11 grab, which
+            # keeps the button from also reaching the focused window.
+            if xbutton == self._target:
+                if w_param == WM_XBUTTONDOWN and modifiers_held(self._modifiers):
+                    self._button_down = True
+                    self._press()
+                    return 1
+                if w_param == WM_XBUTTONUP and self._button_down:
+                    # The modifiers may be up already; the press decided.
+                    self._button_down = False
+                    self._release()
+                    return 1
         return user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+    def _wait_key_up(self):
+        while self.running and is_down(self._target):
+            time.sleep(RELEASE_POLL_S)
+        self._release()
+
+    def _press(self):
+        if not self._held:
+            self._held = True
+            logger.info("Global hotkey pressed! Triggering callback...")
+            self.on_press()
+
+    def _release(self):
+        if self._held:
+            self._held = False
+            self.on_release()
 
     def stop(self):
         self.running = False

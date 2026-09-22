@@ -14,10 +14,11 @@ OBSOLETE_KEYS = ("discord_hotkey", "sound_enabled")
 
 class StateManager(QObject):
     # Signals to notify the UI
-    state_changed = pyqtSignal()            # muted or connected changed
+    state_changed = pyqtSignal()            # voice, call or connection changed
     visuals_updated = pyqtSignal()          # Emits whenever size/color/opacity changes
     config_saved = pyqtSignal()             # Emits when config is saved
     toggle_requested = pyqtSignal()         # A click on the dot asked to flip the mic
+    deaf_toggle_requested = pyqtSignal()    # A middle click on the dot asked to flip deafen
 
     def __init__(self):
         super().__init__()
@@ -25,6 +26,8 @@ class StateManager(QObject):
         # Core runtime state, mirrored from Discord. Nothing is known until
         # the connection comes up, so the dot starts out disconnected.
         self.muted = True
+        self.deafened = False
+        self.in_call = False
         self.connected = False
 
         # Animated values. Opacity here excludes the user's base opacity,
@@ -54,8 +57,8 @@ class StateManager(QObject):
 
     @property
     def active(self):
-        """True while the mic is known to be open."""
-        return self.connected and not self.muted
+        """True while the mic is known to be open in a call."""
+        return self.connected and self.in_call and not (self.muted or self.deafened)
 
     def load_config(self):
         """Loads configuration from JSON file. Falls back to defaults if not found."""
@@ -82,11 +85,14 @@ class StateManager(QObject):
         self.config.setdefault("app_hotkey", constants.DEFAULT_APP_HOTKEY)
         self.config.setdefault("autostart_enabled", constants.DEFAULT_AUTOSTART_ENABLED)
         self.config.setdefault("position_locked", constants.DEFAULT_POSITION_LOCKED)
+        self.config.setdefault("join_muted", constants.DEFAULT_JOIN_MUTED)
+        self.config.setdefault("idle_mute_minutes", constants.DEFAULT_IDLE_MUTE_MINUTES)
         self.config.setdefault("discord_client_id", "")
         self.config.setdefault("discord_client_secret", "")
         self.config.setdefault("discord_access_token", "")
         self.config.setdefault("discord_refresh_token", "")
         self.config.setdefault("discord_token_expires", 0)
+        self.config.setdefault("discord_token_scopes", "")  # space-separated, as Discord sends them
 
     def save_config(self):
         """Writes the configuration to disk atomically.
@@ -118,13 +124,23 @@ class StateManager(QObject):
             self.save_config()
 
     # State modification APIs
-    @pyqtSlot(bool)
-    def set_muted(self, muted):
-        if self.muted == muted:
+    @pyqtSlot(bool, bool)
+    def set_voice(self, muted, deafened):
+        if (self.muted, self.deafened) == (muted, deafened):
             return
 
-        self.muted = muted
-        logger.info(f"Microphone state changed: Muted = {self.muted}")
+        self.muted, self.deafened = muted, deafened
+        logger.info(f"Voice state changed: Muted = {muted}, Deafened = {deafened}")
+        self._reset_animation()
+        self.state_changed.emit()
+
+    @pyqtSlot(bool)
+    def set_in_call(self, in_call):
+        if self.in_call == in_call:
+            return
+
+        self.in_call = in_call
+        logger.info(f"Voice channel changed: In call = {in_call}")
         self._reset_animation()
         self.state_changed.emit()
 
@@ -152,6 +168,9 @@ class StateManager(QObject):
 
     def request_toggle(self):
         self.toggle_requested.emit()
+
+    def request_deaf_toggle(self):
+        self.deaf_toggle_requested.emit()
 
     def set_position(self, x, y):
         if self.config["position_locked"]:
@@ -184,6 +203,14 @@ class StateManager(QObject):
         self.config["autostart_enabled"] = enabled
         self.save_config_debounced()
 
+    def set_join_muted(self, enabled):
+        self.config["join_muted"] = enabled
+        self.save_config_debounced()
+
+    def set_idle_mute_minutes(self, minutes):
+        self.config["idle_mute_minutes"] = max(0, int(minutes))
+        self.save_config_debounced()
+
     def set_discord_credentials(self, client_id, client_secret):
         """Stores the Developer Portal credentials. Tokens issued for other
         credentials are useless, so they are dropped when these change."""
@@ -194,12 +221,14 @@ class StateManager(QObject):
             self.config["discord_access_token"] = ""
             self.config["discord_refresh_token"] = ""
             self.config["discord_token_expires"] = 0
+            self.config["discord_token_scopes"] = ""
             self.save_config()
 
-    def set_discord_tokens(self, access_token, refresh_token, expires_at):
+    def set_discord_tokens(self, access_token, refresh_token, expires_at, scopes):
         self.config["discord_access_token"] = access_token
         self.config["discord_refresh_token"] = refresh_token
         self.config["discord_token_expires"] = int(expires_at)
+        self.config["discord_token_scopes"] = scopes
         self.save_config()
 
     # Drag / Click Handler Methods
@@ -221,18 +250,16 @@ class StateManager(QObject):
         return self.drag_started and not self.config["position_locked"]
 
     def handle_mouse_release(self, global_pos: QPoint):
+        """Returns True when the press and release made a click, not a drag."""
         was_drag = self.drag_started
         self.drag_started = False
-        if not was_drag:
-            # Clean single click -> ask Discord to flip the mic
-            self.request_toggle()
         return not was_drag
 
     # Animation update calculations
     def advance_time(self, dt_ms):
         """Advances the internal timers and updates current visuals based on progress."""
         if not self.active:
-            # Muted or disconnected: values are static
+            # Muted, out of a call or disconnected: values are static
             self.current_size = constants.SIZE_MUTED
             self.current_opacity = constants.OPACITY_MUTED
             self.transition_t = 1.0

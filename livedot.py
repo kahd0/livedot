@@ -1,6 +1,7 @@
 import sys
 import os
 import getpass
+import math
 import logging
 from logging.handlers import RotatingFileHandler
 from PyQt6.QtWidgets import QApplication, QWidget, QMenu
@@ -13,20 +14,26 @@ import autostart
 from state_manager import StateManager
 from input_manager import InputManager
 from discord_rpc import DiscordRPC
+from mic_guard import MicGuard
+from message_alert import MessageAlert
 from settings_dialog import SettingsDialog, HotkeyCaptureDialog
 
 logger = logging.getLogger("livedot.main")
 
 class OverlayWindow(QWidget):
-    def __init__(self, state_manager: StateManager, input_manager: InputManager, discord: DiscordRPC):
+    def __init__(self, state_manager: StateManager, input_manager: InputManager,
+                 discord: DiscordRPC, alert: MessageAlert):
         super().__init__()
         self.state_manager = state_manager
         self.input_manager = input_manager
         self.discord = discord
+        self.alert = alert
 
         # Connect state manager signals
         self.state_manager.visuals_updated.connect(self.update)
         self.state_manager.state_changed.connect(self.on_state_changed)
+        self.alert.changed.connect(self.on_alert_changed)
+        self.alert.popped.connect(self.start_animation)
 
         # Re-check the position when a monitor goes away. Deferred so Qt has
         # finished updating its screen list first.
@@ -38,11 +45,13 @@ class OverlayWindow(QWidget):
         # Local interactive state variables
         self.win_size = constants.WINDOW_SIZE
         self.drag_offset = QPoint()
+        self.press_on_badge = False
         self.settings_dialog = None
 
         # Track time for animations
         self.last_anim_time = 0
         self.flash_start = None  # set by flash()
+        self.flash_blinks = 0
 
         # Animation timer (runs at constants.FPS)
         self.anim_timer = QTimer(self)
@@ -68,6 +77,8 @@ class OverlayWindow(QWidget):
         # Translucent background flags to prevent X11 flicker or borders
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        # The overlay never takes focus, and Qt skips tooltips of inactive windows.
+        self.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
 
         self.update_size()
         self.ensure_valid_position()
@@ -113,13 +124,18 @@ class OverlayWindow(QWidget):
         self.update()
 
     def on_state_changed(self):
-        """Called when the mic or connection state changes."""
+        """Called when the voice, call or connection state changes."""
         if self.state_manager.active:
             # Mic open: run the auto-expand and breathing animation
             self.start_animation()
-        elif not self.is_flashing():
+        elif not (self.is_flashing() or self.alert.is_popping()):
             # Muted or disconnected (calma visual) drops the timer to conserve CPU
             self.anim_timer.stop()
+        self.update()
+        self.raise_()
+
+    def on_alert_changed(self):
+        self.setToolTip(self.alert.tooltip())
         self.update()
         self.raise_()
 
@@ -135,18 +151,18 @@ class OverlayWindow(QWidget):
         self.last_anim_time = current_time
 
         # Advance timers inside state manager
-        if self.state_manager.advance_time(dt_ms) or self.is_flashing():
+        if (self.state_manager.advance_time(dt_ms) or self.is_flashing()
+                or self.alert.is_popping()):
             self.update()
         else:
-            # The flash just ended on a static dot: erase it and rest
+            # The flash or pop just ended on a static dot: draw it at rest
             self.anim_timer.stop()
             self.update()
 
-    def flash(self):
-        """Blinks a ring around the dot so it is easy to find. Called when the
-        app is launched again while this instance is already running."""
-        logger.info("App launched again: flashing the dot.")
+    def flash(self, blinks=constants.FLASH_BLINKS):
+        """Blinks an amber ring around the dot to draw the eye to it."""
         self.flash_start = QDateTime.currentMSecsSinceEpoch()
+        self.flash_blinks = blinks
         self.ensure_valid_position()
         self.show()
         self.raise_()
@@ -155,7 +171,8 @@ class OverlayWindow(QWidget):
 
     def is_flashing(self):
         return (self.flash_start is not None and
-                QDateTime.currentMSecsSinceEpoch() - self.flash_start < constants.FLASH_DURATION_MS)
+                QDateTime.currentMSecsSinceEpoch() - self.flash_start
+                < constants.FLASH_PERIOD_MS * self.flash_blinks)
 
     # Paint event
     def paintEvent(self, event):
@@ -168,10 +185,14 @@ class OverlayWindow(QWidget):
         painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
         center = QPointF(self.win_size / 2.0, self.win_size / 2.0)
-        if self.state_manager.connected:
-            self.paint_dot(painter, center)
-        else:
+        if not self.state_manager.connected:
             self.paint_disconnected(painter, center)
+        elif not self.state_manager.in_call:
+            self.paint_idle(painter, center)
+        else:
+            self.paint_dot(painter, center)
+        if self.alert.visible:
+            self.paint_badge(painter, center)
         if self.is_flashing():
             self.paint_flash(painter, center)
 
@@ -185,10 +206,61 @@ class OverlayWindow(QWidget):
         radius = constants.SIZE_MUTED * scale / 2.0
         painter.drawEllipse(center, radius, radius)
 
+    def paint_idle(self, painter, center):
+        """Faint speck: outside a voice channel nobody can hear the mic, so
+        its state is left out rather than shown in red."""
+        scale = self.state_manager.config["scale"]
+        color = QColor(*constants.COLOR_IDLE)
+        color.setAlphaF(constants.OPACITY_IDLE * self.state_manager.config["opacity"])
+        painter.setBrush(QBrush(color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        radius = constants.SIZE_IDLE * scale / 2.0
+        painter.drawEllipse(center, radius, radius)
+
+    def badge_center(self, center):
+        """Up and to the right of the dot, clear of its resting size. The
+        pulse is ignored so the badge stays put."""
+        state = self.state_manager
+        if not state.in_call:
+            dot_size = constants.SIZE_IDLE
+        elif state.active:
+            dot_size = constants.SIZE_UNMUTED
+        else:
+            dot_size = constants.SIZE_MUTED
+        offset = (dot_size / 2.0 + constants.BADGE_OFFSET) * state.config["scale"] * math.sqrt(0.5)
+        return QPointF(center.x() + offset, center.y() - offset)
+
+    def paint_badge(self, painter, center):
+        """Blurple satellite: solid for a DM or mention, a ring otherwise."""
+        scale = self.state_manager.config["scale"]
+        radius = constants.SIZE_BADGE * scale / 2.0 * self.alert.pop_scale()
+        if radius <= 0:
+            return
+        opacity = self.state_manager.config["opacity"]
+        color = QColor(*constants.COLOR_MESSAGE)
+        color.setAlphaF(opacity)
+        if self.alert.direct:
+            border = QColor(*constants.COLOR_BORDER)
+            border.setAlphaF(opacity * 0.7)
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(border, 1.0 * scale))
+        else:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(color, 2.0 * scale))
+        painter.drawEllipse(self.badge_center(center), radius, radius)
+
+    def is_on_badge(self, pos: QPointF):
+        if not self.alert.visible:
+            return False
+        center = QPointF(self.win_size / 2.0, self.win_size / 2.0)
+        hit = (constants.SIZE_BADGE / 2.0 + constants.BADGE_HIT_SLOP) * self.state_manager.config["scale"]
+        delta = pos - self.badge_center(center)
+        return math.hypot(delta.x(), delta.y()) <= hit
+
     def paint_flash(self, painter, center):
         """Amber ring, on for the first half of each blink. Drawn at full
         opacity so the dot can be found even at the lowest base opacity."""
-        period = constants.FLASH_DURATION_MS / constants.FLASH_BLINKS
+        period = constants.FLASH_PERIOD_MS
         elapsed = QDateTime.currentMSecsSinceEpoch() - self.flash_start
         if elapsed % period >= period / 2:
             return
@@ -228,11 +300,23 @@ class OverlayWindow(QWidget):
 
         painter.drawEllipse(center, radius, radius)
 
+        if state.deafened:
+            # Second ring: not hearing anyone either
+            ring_color = QColor(*color_rgb)
+            ring_color.setAlphaF(opacity)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(ring_color, 1.5 * scale))
+            ring_radius = radius + constants.DEAF_RING_GAP * scale
+            painter.drawEllipse(center, ring_radius, ring_radius)
+
     # Mouse / Drag Events
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.state_manager.handle_mouse_press(event.globalPosition().toPoint())
             self.drag_offset = event.position().toPoint()
+            self.press_on_badge = self.is_on_badge(event.position())
+        elif event.button() == Qt.MouseButton.MiddleButton:
+            self.state_manager.request_deaf_toggle()
         elif event.button() == Qt.MouseButton.RightButton:
             self.show_context_menu(event.globalPosition().toPoint())
 
@@ -246,8 +330,13 @@ class OverlayWindow(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            # A click (not a drag) asks Discord to toggle the mic
-            self.state_manager.handle_mouse_release(event.globalPosition().toPoint())
+            # A click (not a drag) on the badge opens the message, anywhere
+            # else it asks Discord to toggle the mic
+            if self.state_manager.handle_mouse_release(event.globalPosition().toPoint()):
+                if self.press_on_badge:
+                    self.alert.open()
+                else:
+                    self.state_manager.request_toggle()
 
     def show_settings(self):
         """Displays the unified settings window."""
@@ -480,13 +569,24 @@ def main():
 
     # Discord is the single source of truth: clicks and the hotkey only ask it
     # to toggle, and the dot changes when Discord reports the new state.
-    discord.voice_changed.connect(state_manager.set_muted)
+    discord.voice_changed.connect(state_manager.set_voice)
+    discord.call_changed.connect(state_manager.set_in_call)
     discord.connection_changed.connect(state_manager.set_connected)
     state_manager.toggle_requested.connect(discord.toggle_mute)
-    input_manager.triggered.connect(discord.toggle_mute)
+    state_manager.deaf_toggle_requested.connect(discord.toggle_deaf)
+    guard = MicGuard(state_manager, discord)
+    input_manager.pressed.connect(guard.hotkey_pressed)
+    input_manager.released.connect(guard.hotkey_released)
 
-    window = OverlayWindow(state_manager, input_manager, discord)
-    instance_server = start_instance_server(window.flash)
+    alert = MessageAlert(discord)
+    window = OverlayWindow(state_manager, input_manager, discord, alert)
+    discord.call_joined.connect(lambda: window.flash(constants.JOIN_FLASH_BLINKS))
+    guard.auto_muted.connect(window.flash)
+
+    def on_launched_again():
+        logger.info("App launched again: flashing the dot.")
+        window.flash()
+    instance_server = start_instance_server(on_launched_again)
     discord.start()
 
     def cleanup():

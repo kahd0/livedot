@@ -1,4 +1,5 @@
-"""X11/Linux input backend: global hotkey grabs on the root window."""
+"""X11/Linux input backend: global hotkey grabs on the root window, reporting
+both the press and the release."""
 
 import select
 import threading
@@ -44,6 +45,10 @@ IGNORED_LOCKS = (0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask)
 # stamps both halves of a pair separately, so they can be a millisecond apart;
 # no human releases and presses a key again this fast.
 AUTOREPEAT_WINDOW_MS = 20
+
+# A KeyRelease only counts once no autorepeat KeyPress has followed it for
+# this long. Both halves are sent together, so this is plenty.
+RELEASE_CONFIRM_S = 0.03
 
 # Backoff ceiling when the X connection drops and has to be reopened.
 RECONNECT_MAX_S = 30
@@ -115,23 +120,26 @@ def get_keycode_from_keysym(display, keysym_name):
 
 
 class HotkeyListenerThread(threading.Thread):
-    """Grabs the hotkey on the root window and calls back on every press.
+    """Grabs the hotkey on the root window and calls back on every press and
+    release.
 
     Reconnects on its own if the X connection drops, so the hotkey doesn't
     silently die for the rest of the session.
     """
 
-    def __init__(self, hotkey_str, trigger_callback):
+    def __init__(self, hotkey_str, on_press, on_release):
         super().__init__(daemon=True)
         self.hotkey_str = hotkey_str
-        self.callback = trigger_callback
+        self.on_press = on_press
+        self.on_release = on_release
         self.error = None  # human-readable reason the hotkey isn't working
         self.display = None
         self._stop_event = threading.Event()
         self._is_mouse = False
         self._keycode = 0
         self._button = 0
-        self._last_release = None
+        self._held = False
+        self._pending_release = None  # server time of a KeyRelease not yet confirmed
 
     def run(self):
         delay = 1
@@ -158,14 +166,20 @@ class HotkeyListenerThread(threading.Thread):
             if self._stop_event.is_set() or not self._grab(display):
                 return False
             self.error = None
-            self._last_release = None
+            self._held = False
+            self._pending_release = None
             while not self._stop_event.is_set():
                 # Drain what is queued, then wait on the socket with a timeout
                 # so stop() is noticed. Closing the display from another
                 # thread would not wake a blocked next_event().
                 while display.pending_events():
                     self._handle_event(display.next_event())
-                select.select([display], [], [], POLL_INTERVAL_S)
+                waiting = self._pending_release is not None
+                readable, _, _ = select.select([display], [], [],
+                                               RELEASE_CONFIRM_S if waiting else POLL_INTERVAL_S)
+                if waiting and not readable:
+                    self._pending_release = None
+                    self._release()
             return False
         except Exception as e:
             if self._stop_event.is_set():
@@ -200,7 +214,8 @@ class HotkeyListenerThread(threading.Thread):
         for lock in IGNORED_LOCKS:
             if self._is_mouse:
                 root.grab_button(self._button, modifiers | lock, True,
-                                 X.ButtonPressMask, X.GrabModeAsync, X.GrabModeAsync,
+                                 X.ButtonPressMask | X.ButtonReleaseMask,
+                                 X.GrabModeAsync, X.GrabModeAsync,
                                  X.NONE, X.NONE, onerror=catcher)
             else:
                 root.grab_key(self._keycode, modifiers | lock, True,
@@ -219,18 +234,31 @@ class HotkeyListenerThread(threading.Thread):
     def _handle_event(self, event):
         if self._is_mouse:
             if event.type == X.ButtonPress and event.detail == self._button:
-                self._fire()
+                self._press()
+            elif event.type == X.ButtonRelease and event.detail == self._button:
+                self._release()
         elif event.type == X.KeyRelease and event.detail == self._keycode:
-            self._last_release = event.time
+            self._pending_release = event.time  # confirmed by the event loop
         elif event.type == X.KeyPress and event.detail == self._keycode:
-            if (self._last_release is not None
-                    and (event.time - self._last_release) & 0xFFFFFFFF <= AUTOREPEAT_WINDOW_MS):
+            if (self._pending_release is not None
+                    and (event.time - self._pending_release) & 0xFFFFFFFF <= AUTOREPEAT_WINDOW_MS):
+                self._pending_release = None
                 return  # autorepeat while the key is held down
-            self._fire()
+            if self._pending_release is not None:
+                self._pending_release = None
+                self._release()
+            self._press()
 
-    def _fire(self):
-        logger.info("Global hotkey pressed! Triggering callback...")
-        self.callback()
+    def _press(self):
+        if not self._held:
+            self._held = True
+            logger.info("Global hotkey pressed! Triggering callback...")
+            self.on_press()
+
+    def _release(self):
+        if self._held:
+            self._held = False
+            self.on_release()
 
     def stop(self):
         self._stop_event.set()
